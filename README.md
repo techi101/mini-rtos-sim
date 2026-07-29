@@ -38,43 +38,7 @@ pytest tests/ -v
 
 ## Sample Output
 
-```
-  Scenario : MUTEX
-  Tasks    : SensorRead, UARTTransmit, DataProcess
-  Max ticks: 25
-
-  MINIRTOS SIMULATOR — Priority Preemptive Scheduler
-  ════════════════════════════════════════════════════════════
-
-  EXECUTION TIMELINE
-  ────────────────────────────────────────────────────────────
-  Tick   0 │ SensorRead       ███████ RUNNING    │ pri=3  rem=4
-  Tick   1 │ SensorRead       ███████ RUNNING    │ pri=3  rem=3
-  Tick   2 │ SensorRead       ███████ RUNNING    │ pri=3  rem=2
-  Tick   3 │ SensorRead       ███████ RUNNING    │ pri=3  rem=1
-  Tick   4 │ SensorRead       ███████ RUNNING    │ pri=3  rem=0
-  Tick   5 │ UARTTransmit     ███████ RUNNING    │ pri=2  rem=5
-  Tick   6 │ UARTTransmit     ███████ RUNNING    │ pri=2  rem=4
-  ...
-
-  EVENT LOG
-  ────────────────────────────────────────────────────────────
-  t=0   │ ARRIVED: SensorRead entered Ready Queue
-  t=2   │ ARRIVED: UARTTransmit entered Ready Queue
-  t=2   │ MUTEX: UARTTransmit ACQUIRED 'uart_lock'
-  t=4   │ ARRIVED: DataProcess entered Ready Queue
-  t=4   │ MUTEX: DataProcess BLOCKED on 'uart_lock' (held by UARTTransmit)
-  t=5   │ DONE: SensorRead completed at tick 5
-  t=8   │ MUTEX: UARTTransmit RELEASED 'uart_lock'
-  t=8   │ MUTEX: DataProcess UNBLOCKED — acquired 'uart_lock'
-
-  FINAL STATISTICS
-  ════════════════════════════════════════════════════════════
-  Total ticks simulated  : 20
-  CPU utilisation        : 100.0%
-  Preemption events      : 0
-  Mutex contention events: 1
-```
+![MiniRTOS Terminal Output](rtos_demo.png)
 
 ---
 
