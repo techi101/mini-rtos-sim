@@ -17,6 +17,7 @@ always gets the CPU. If a higher-priority task becomes ready mid-execution of
 a lower-priority task, the lower-priority task is immediately PREEMPTED.
 """
 
+import copy
 from typing import List, Dict, Optional, Tuple
 from task import Task, TaskState
 from mutex import Mutex
@@ -153,7 +154,7 @@ class Scheduler:
             # ── Step 8: Record this tick ─────────────────────────────────
             self.timeline.append({
                 "tick": tick,
-                "running_task": self.tasks[self.tasks.index(candidate)] if candidate else None,
+                "running_task": copy.copy(candidate) if candidate else None,
                 "events": events,
                 "deadlock": False,
             })
