@@ -11,9 +11,10 @@ How a real RTOS mutex works:
   3. Task A calls mutex.release() → mutex is free again.
   4. Task B is UNBLOCKED and moved back to READY state.
 
-This is exactly what this class simulates. The waiting_tasks list represents
-the queue of tasks that are blocked waiting for this mutex — in a real RTOS
-this is managed by the kernel's block list.
+This class owns the *ownership and queueing* half of that story. The priority
+side of it — priority inheritance, and detecting circular waits — lives in
+`scheduler.py`, because both need a view of every task and every mutex at
+once, which a single lock does not have.
 
 ARM Mbed OS Mutex documentation:
   https://os.mbed.com/docs/mbed-os/v6.16/apis/mutex.html
@@ -32,7 +33,7 @@ class Mutex:
     Attributes:
         name         : Identifier for this mutex (e.g., "uart_lock").
         owner        : The Task that currently holds this mutex, or None.
-        waiting_tasks: Ordered list of Tasks blocked waiting to acquire it.
+        waiting_tasks: Tasks blocked waiting to acquire it.
     """
 
     def __init__(self, name: str):
@@ -51,6 +52,18 @@ class Mutex:
     def is_free(self) -> bool:
         return not self.is_locked
 
+    def highest_waiter_priority(self) -> Optional[int]:
+        """
+        Effective priority of the most urgent task blocked on this mutex,
+        or None if nobody is waiting.
+
+        The scheduler uses this to work out how much priority the owner
+        should inherit.
+        """
+        if not self.waiting_tasks:
+            return None
+        return max(t.effective_priority for t in self.waiting_tasks)
+
     def try_acquire(self, task: "Task") -> bool:
         """
         Attempt to acquire the mutex on behalf of `task`.
@@ -59,31 +72,47 @@ class Mutex:
             True  — mutex was free; task now owns it.
             False — mutex was held; task has been added to the wait queue
                     and should be moved to BLOCKED state by the scheduler.
+
+        Raises:
+            RuntimeError: If `task` already owns this mutex. This is a
+                non-recursive mutex, so re-acquiring is a programming error
+                that would otherwise make the task wait on itself forever.
         """
+        if self.owner is task:
+            raise RuntimeError(
+                f"Task '{task.name}' re-acquired mutex '{self.name}' it already "
+                f"owns. This mutex is non-recursive (as ARM Mbed OS mutexes are "
+                f"by default), so this would self-deadlock."
+            )
+
         if self.is_free:
             self.owner = task
             self.acquisition_count += 1
+            if self.name not in task.held_mutexes:
+                task.held_mutexes.append(self.name)
             return True
-        else:
-            # Mutex is already held — block this task
-            if task not in self.waiting_tasks:
-                self.waiting_tasks.append(task)
-                self.contention_count += 1
-            return False
+
+        # Mutex is already held — block this task
+        if task not in self.waiting_tasks:
+            self.waiting_tasks.append(task)
+            self.contention_count += 1
+        return False
 
     def release(self, task: "Task") -> Optional["Task"]:
         """
         Release the mutex from `task`.
 
         If other tasks are waiting, the highest-priority waiter is granted
-        the mutex immediately (priority-ordered unblocking, as in a real RTOS).
+        the mutex immediately (direct handoff, as in a real RTOS). Waking the
+        longest-waiting task instead would let a low-priority task jump ahead
+        of a high-priority one.
 
         Args:
             task: The task releasing the mutex. Must be the current owner.
 
         Returns:
-            The next task that has been granted the mutex (now READY),
-            or None if no tasks were waiting.
+            The next task that has been granted the mutex (caller must move
+            it to READY), or None if no tasks were waiting.
 
         Raises:
             RuntimeError: If `task` is not the current owner (invalid release).
@@ -95,16 +124,22 @@ class Mutex:
                 f"'{self.owner.name if self.owner else 'None'}'"
             )
 
+        if self.name in task.held_mutexes:
+            task.held_mutexes.remove(self.name)
+
         if not self.waiting_tasks:
             self.owner = None
             return None
 
-        # Grant to the highest-priority waiting task
-        # (sort descending by priority — highest priority wins)
-        self.waiting_tasks.sort(key=lambda t: t.priority, reverse=True)
+        # Grant to the highest-priority waiting task. Sorting by effective
+        # priority means a waiter that has itself been boosted by inheritance
+        # is honoured at its boosted level.
+        self.waiting_tasks.sort(key=lambda t: t.effective_priority, reverse=True)
         next_owner = self.waiting_tasks.pop(0)
         self.owner = next_owner
         self.acquisition_count += 1
+        if self.name not in next_owner.held_mutexes:
+            next_owner.held_mutexes.append(self.name)
         return next_owner
 
     def __repr__(self) -> str:

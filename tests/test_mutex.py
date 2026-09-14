@@ -103,3 +103,54 @@ class TestMutexProperties:
         mutex.try_acquire(task_a)
         mutex.release(task_a)
         assert mutex.is_free
+
+
+# ── Ownership bookkeeping (needed by priority inheritance) ───────────────────
+
+class TestOwnershipTracking:
+    def test_acquire_records_mutex_on_owner(self, mutex, task_a):
+        mutex.try_acquire(task_a)
+        assert "test_lock" in task_a.held_mutexes
+
+    def test_release_clears_mutex_from_owner(self, mutex, task_a):
+        mutex.try_acquire(task_a)
+        mutex.release(task_a)
+        assert "test_lock" not in task_a.held_mutexes
+
+    def test_handoff_transfers_ownership_record(self, mutex, task_a, task_b):
+        mutex.try_acquire(task_a)
+        mutex.try_acquire(task_b)
+        mutex.release(task_a)
+        assert "test_lock" not in task_a.held_mutexes
+        assert "test_lock" in task_b.held_mutexes
+
+    def test_recursive_acquire_is_rejected(self, mutex, task_a):
+        """
+        This is a non-recursive mutex, as ARM Mbed OS mutexes are by default.
+        Silently queueing the owner behind itself would be an unbreakable
+        self-deadlock, so it raises instead.
+        """
+        mutex.try_acquire(task_a)
+        with pytest.raises(RuntimeError, match="non-recursive"):
+            mutex.try_acquire(task_a)
+
+
+class TestWaiterPriority:
+    def test_highest_waiter_priority_is_none_when_uncontended(self, mutex, task_a):
+        mutex.try_acquire(task_a)
+        assert mutex.highest_waiter_priority() is None
+
+    def test_highest_waiter_priority_reports_max(self, mutex, task_a, task_b, task_c):
+        mutex.try_acquire(task_a)
+        mutex.try_acquire(task_c)   # pri 1
+        mutex.try_acquire(task_b)   # pri 2
+        assert mutex.highest_waiter_priority() == 2
+
+    def test_handoff_honours_inherited_priority(self, mutex, task_a, task_b, task_c):
+        """A waiter boosted by inheritance must win the handoff at its
+        boosted level, not its base level."""
+        mutex.try_acquire(task_a)
+        mutex.try_acquire(task_b)   # base pri 2
+        mutex.try_acquire(task_c)   # base pri 1, boosted to 5
+        task_c.inherited_priority = 5
+        assert mutex.release(task_a) is task_c

@@ -2,14 +2,22 @@
 minirtos.py — CLI Entry Point for MiniRTOS Simulator
 
 Usage:
-    python minirtos.py                      (run the default embedded scenario)
-    python minirtos.py --scenario basic     (3 simple tasks, no mutexes)
-    python minirtos.py --scenario mutex     (mutex contention between 2 tasks)
-    python minirtos.py --scenario deadlock  (deliberate deadlock demonstration)
-    python minirtos.py --ticks 30           (run for 30 ticks instead of default)
+    python minirtos.py                        (default: mutex contention)
+    python minirtos.py --scenario basic       (3 tasks, no mutexes)
+    python minirtos.py --scenario mutex       (mutex contention between 2 tasks)
+    python minirtos.py --scenario inversion   (priority inversion)
+    python minirtos.py --scenario deadlock    (circular wait demonstration)
+    python minirtos.py --scenario inversion --no-priority-inheritance
+    python minirtos.py --ticks 30             (run for 30 ticks)
 
 The simulator demonstrates Priority Preemptive Scheduling — the scheduling
 algorithm used by ARM Mbed OS, FreeRTOS, and Zephyr RTOS.
+
+Mutex operations are declared per task with `LockOp(after_ticks, action,
+mutex)`, where `after_ticks` counts that task's *own* consumed CPU ticks.
+This is what a real task does: it calls acquire() at a point in its own
+instruction stream, which slides in wall-clock time whenever the task is
+preempted or blocked.
 
 Exit codes:
     0 — simulation completed normally
@@ -20,10 +28,13 @@ import argparse
 import sys
 from typing import List, Dict, Tuple
 
-from task import Task
+from task import Task, LockOp
 from mutex import Mutex
 from scheduler import Scheduler
 from renderer import Renderer
+
+
+Scenario = Tuple[List[Task], Dict[str, Mutex]]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -31,81 +42,125 @@ from renderer import Renderer
 #  Each scenario represents a realistic embedded system configuration.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def scenario_basic() -> Tuple[List[Task], Dict[str, Mutex], Dict]:
+def scenario_basic() -> Scenario:
     """
     Three tasks with different priorities and burst times.
     No mutexes — demonstrates pure priority preemption.
 
     Models a typical embedded system:
-      SensorRead   — highest priority (must respond to hardware events fast)
-      DataProcess  — medium priority  (processes the sensor data)
-      DisplayUpdate— lowest priority  (updates a display at low frequency)
+      SensorRead    — highest priority (must respond to hardware events fast)
+      DataProcess   — medium priority  (processes the sensor data)
+      DisplayUpdate — lowest priority  (updates a display at low frequency)
+
+    Expected: SensorRead runs to completion first; DataProcess arrives at
+    t=2 but waits; DisplayUpdate arrives at t=4 and runs last.
     """
     tasks = [
         Task("SensorRead",    priority=3, burst=5, arrival_tick=0),
         Task("DataProcess",   priority=2, burst=8, arrival_tick=2),
         Task("DisplayUpdate", priority=1, burst=6, arrival_tick=4),
     ]
-    return tasks, {}, {}
+    return tasks, {}
 
 
-def scenario_mutex() -> Tuple[List[Task], Dict[str, Mutex], Dict]:
+def scenario_mutex() -> Scenario:
     """
-    Two tasks competing for a shared UART peripheral (protected by a mutex).
+    Two tasks competing for a shared UART peripheral behind a mutex.
 
-    Timeline:
-      t=0  SensorRead arrives, runs (highest priority)
-      t=2  UARTTransmit arrives, acquires uart_lock, starts running
-      t=4  DataProcess arrives, tries to acquire uart_lock → BLOCKED
-      t=6  UARTTransmit releases uart_lock → DataProcess UNBLOCKED
-    """
-    tasks = [
-        Task("SensorRead",   priority=3, burst=5, arrival_tick=0),
-        Task("UARTTransmit", priority=2, burst=6, arrival_tick=2),
-        Task("DataProcess",  priority=2, burst=8, arrival_tick=4),
-    ]
-    mutexes = {
-        "uart_lock": Mutex("uart_lock"),
-    }
-    # (tick) → (task_name, "mutex_name" to acquire OR "mutex_name_release" to release)
-    mutex_requests = {
-        2: ("UARTTransmit", "uart_lock"),           # t=2: UARTTransmit acquires lock
-        4: ("DataProcess",  "uart_lock"),            # t=4: DataProcess tries → BLOCKED
-        8: ("UARTTransmit", "uart_lock_release"),    # t=8: UARTTransmit releases → DataProcess unblocks
-    }
-    return tasks, mutexes, mutex_requests
+    UARTTransmit takes uart_lock one tick into its own execution and holds it
+    for three more of its ticks. DataProcess arrives later at a higher
+    priority, preempts UARTTransmit, reaches for the same lock one tick into
+    its own execution, finds it held, and blocks until the handoff.
 
-
-def scenario_deadlock() -> Tuple[List[Task], Dict[str, Mutex], Dict]:
-    """
-    Demonstrates a deadlock — two tasks each holding one mutex while
-    waiting for the other. The simulator detects and reports this.
-
-    This is a textbook example of the "deadly embrace" problem.
-    Real RTOS prevention: enforce a global mutex acquisition order.
+    Note that no absolute tick numbers appear here. Contention arises from
+    the scheduling itself: DataProcess outranks UARTTransmit, so it preempts
+    into the middle of the critical section. Change any priority or arrival
+    time and the lock operations still happen at the right point in each
+    task's own execution.
     """
     tasks = [
-        Task("TaskAlpha", priority=2, burst=10, arrival_tick=0),
-        Task("TaskBeta",  priority=2, burst=10, arrival_tick=0),
+        Task("SensorRead",   priority=3, burst=3, arrival_tick=0),
+        Task("UARTTransmit", priority=1, burst=6, arrival_tick=0,
+             lock_ops=[LockOp(1, "acquire", "uart_lock"),
+                       LockOp(4, "release", "uart_lock")]),
+        Task("DataProcess",  priority=2, burst=4, arrival_tick=6,
+             lock_ops=[LockOp(1, "acquire", "uart_lock"),
+                       LockOp(3, "release", "uart_lock")]),
     ]
-    mutexes = {
-        "mutex_A": Mutex("mutex_A"),
-        "mutex_B": Mutex("mutex_B"),
-    }
-    mutex_requests = {
-        0: ("TaskAlpha", "mutex_A"),    # Alpha acquires A
-        1: ("TaskBeta",  "mutex_B"),    # Beta  acquires B
-        2: ("TaskAlpha", "mutex_B"),    # Alpha tries B → BLOCKED (Beta holds it)
-        3: ("TaskBeta",  "mutex_A"),    # Beta  tries A → BLOCKED (Alpha holds it)
-        # Both tasks are now BLOCKED → deadlock
-    }
-    return tasks, mutexes, mutex_requests
+    return tasks, {"uart_lock": Mutex("uart_lock")}
+
+
+def scenario_inversion() -> Scenario:
+    """
+    The classic three-task priority inversion.
+
+    LowLogger (pri 1) takes the shared bus. HighControl (pri 3) then needs
+    the same bus and blocks. MidCrunch (pri 2) needs nothing at all — but it
+    outranks LowLogger, so under plain priority scheduling it runs while the
+    highest-priority task in the system sits waiting on a lock held by the
+    lowest-priority one. The delay is bounded only by how long the medium
+    task feels like running, which is why it is called *unbounded* priority
+    inversion.
+
+    Priority inheritance fixes it: LowLogger temporarily runs at HighControl's
+    priority, so it outruns MidCrunch, reaches its release, and hands the bus
+    over.
+
+    Run it both ways to see the difference:
+        python minirtos.py --scenario inversion
+        python minirtos.py --scenario inversion --no-priority-inheritance
+
+    This is the failure mode that put the Mars Pathfinder lander into a
+    watchdog reset loop in 1997.
+    """
+    tasks = [
+        Task("LowLogger",   priority=1, burst=6, arrival_tick=0,
+             lock_ops=[LockOp(1, "acquire", "shared_bus"),
+                       LockOp(4, "release", "shared_bus")]),
+        Task("MidCrunch",   priority=2, burst=6, arrival_tick=3),
+        Task("HighControl", priority=3, burst=4, arrival_tick=4,
+             lock_ops=[LockOp(1, "acquire", "shared_bus"),
+                       LockOp(3, "release", "shared_bus")]),
+    ]
+    return tasks, {"shared_bus": Mutex("shared_bus")}
+
+
+def scenario_deadlock() -> Scenario:
+    """
+    A genuine circular wait — the "deadly embrace".
+
+    TaskAlpha takes mutex_A then wants mutex_B; TaskBeta takes mutex_B then
+    wants mutex_A. The interleaving that makes this happen is produced by the
+    scheduler itself: TaskBeta arrives later but at a higher priority, so it
+    preempts TaskAlpha in between Alpha's two acquisitions.
+
+    Watch the event log: priority inheritance fires first (Alpha is boosted
+    because Beta is waiting on a lock Alpha holds), and only when Alpha then
+    reaches for mutex_B does the cycle close. Inheritance bounds inversion;
+    it does nothing about lock-ordering bugs. The fix for this one is a
+    global acquisition order.
+    """
+    tasks = [
+        Task("TaskAlpha", priority=1, burst=10, arrival_tick=0,
+             lock_ops=[LockOp(1, "acquire", "mutex_A"),
+                       LockOp(3, "acquire", "mutex_B"),
+                       LockOp(8, "release", "mutex_B"),
+                       LockOp(9, "release", "mutex_A")]),
+        Task("TaskBeta",  priority=2, burst=10, arrival_tick=2,
+             lock_ops=[LockOp(1, "acquire", "mutex_B"),
+                       LockOp(2, "acquire", "mutex_A"),
+                       LockOp(8, "release", "mutex_A"),
+                       LockOp(9, "release", "mutex_B")]),
+    ]
+    mutexes = {"mutex_A": Mutex("mutex_A"), "mutex_B": Mutex("mutex_B")}
+    return tasks, mutexes
 
 
 SCENARIOS = {
-    "basic"    : scenario_basic,
-    "mutex"    : scenario_mutex,
-    "deadlock" : scenario_deadlock,
+    "basic"     : scenario_basic,
+    "mutex"     : scenario_mutex,
+    "inversion" : scenario_inversion,
+    "deadlock"  : scenario_deadlock,
 }
 
 
@@ -123,12 +178,14 @@ def build_cli() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Scenarios:\n"
-            "  basic    — 3 tasks, no mutexes (pure preemption demo)\n"
-            "  mutex    — 2 tasks share a mutex (contention + blocking demo)\n"
-            "  deadlock — deliberate deadlock to demonstrate detection\n\n"
+            "  basic     — 3 tasks, no mutexes (pure preemption demo)\n"
+            "  mutex     — 2 tasks share a mutex (contention + blocking)\n"
+            "  inversion — priority inversion, with and without inheritance\n"
+            "  deadlock  — circular wait, detected via the wait-for graph\n\n"
             "Examples:\n"
             "  python minirtos.py\n"
-            "  python minirtos.py --scenario mutex\n"
+            "  python minirtos.py --scenario inversion\n"
+            "  python minirtos.py --scenario inversion --no-priority-inheritance\n"
             "  python minirtos.py --scenario deadlock --ticks 15\n"
         ),
     )
@@ -145,34 +202,38 @@ def build_cli() -> argparse.ArgumentParser:
         metavar="N",
         help="Maximum number of clock ticks to simulate (default: 25)",
     )
+    ap.add_argument(
+        "--no-priority-inheritance",
+        action="store_true",
+        help="Disable the priority-inheritance protocol, to show the "
+             "unbounded inversion it prevents",
+    )
     return ap
 
 
-def main() -> int:
-    # Reconfigure stdout to UTF-8 so box-drawing characters render
-    # correctly on Windows terminals (which default to cp1252).
-    if hasattr(sys.stdout, 'reconfigure'):
-        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+def main(argv=None) -> int:
+    # Reconfigure stdout to UTF-8 so box-drawing characters render correctly
+    # on Windows terminals (which default to cp1252).
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    args = build_cli().parse_args()
+    args = build_cli().parse_args(argv)
 
-    # Load the scenario
-    tasks, mutexes, mutex_requests = SCENARIOS[args.scenario]()
+    tasks, mutexes = SCENARIOS[args.scenario]()
 
     print(f"\n  Scenario : {args.scenario.upper()}")
     print(f"  Tasks    : {', '.join(t.name for t in tasks)}")
     print(f"  Max ticks: {args.ticks}")
 
-    # Run the simulation
-    sched    = Scheduler(tasks, mutexes, mutex_requests)
+    sched = Scheduler(
+        tasks, mutexes,
+        enable_priority_inheritance=not args.no_priority_inheritance,
+    )
     timeline = sched.run(max_ticks=args.ticks)
-    stats    = sched.get_statistics()
+    stats = sched.get_statistics()
 
-    # Render results
-    renderer = Renderer([t.name for t in tasks])
-    renderer.render(timeline, stats)
+    Renderer([t.name for t in tasks]).render(timeline, stats)
 
-    # Exit code 1 if deadlock was detected
     return 1 if stats["deadlock_tick"] is not None else 0
 
 

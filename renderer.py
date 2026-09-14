@@ -1,17 +1,20 @@
 """
 renderer.py — Timeline Visualiser for MiniRTOS Simulator
 
-Takes the raw timeline output from the Scheduler and renders it
-as a readable, colour-coded execution chart in the terminal —
-similar to a Gantt chart used in RTOS documentation.
+Takes the raw timeline output from the Scheduler and renders it as a
+readable, colour-coded execution chart in the terminal — similar to a Gantt
+chart used in RTOS documentation.
 
-Also renders the final statistics table showing per-task CPU usage,
-wait time, turnaround time, and mutex contention data.
+Also renders the final statistics table showing per-task CPU usage, wait
+time, blocked time, turnaround time, and mutex contention data.
+
+The timeline entries are plain dicts of values captured at the moment each
+tick ran, so what is drawn here is what the scheduler actually did — the
+renderer never re-reads mutable task state after the fact.
 """
 
-import os
 import sys
-from typing import List, Dict, Optional
+from typing import List, Dict
 
 # ── Colour helpers ────────────────────────────────────────────────────────────
 _TTY = sys.stdout.isatty()
@@ -26,9 +29,6 @@ YELLOW = lambda t: _c(t, "33")
 CYAN   = lambda t: _c(t, "36")
 MAGENTA= lambda t: _c(t, "35")
 DIM    = lambda t: _c(t, "2")
-BG_GRN = lambda t: _c(t, "42;30")
-BG_RED = lambda t: _c(t, "41;37")
-BG_YEL = lambda t: _c(t, "43;30")
 
 
 # Assign a colour to each task by its index in the task list
@@ -47,7 +47,7 @@ class Renderer:
 
     def render(self, timeline: List[Dict], stats: Dict) -> None:
         print()
-        self._render_header()
+        self._render_header(stats)
         self._render_timeline(timeline)
         self._render_events(timeline)
         self._render_statistics(stats)
@@ -55,9 +55,12 @@ class Renderer:
 
     # ── Private renderers ─────────────────────────────────────────────────
 
-    def _render_header(self) -> None:
+    def _render_header(self, stats: Dict) -> None:
         print(BOLD("  MINIRTOS SIMULATOR — Priority Preemptive Scheduler"))
-        print("  " + "═" * 60)
+        pi = ("priority inheritance: ON" if stats["priority_inheritance_enabled"]
+              else "priority inheritance: OFF")
+        print("  " + DIM(pi))
+        print("  " + "═" * 64)
         print()
 
     def _render_timeline(self, timeline: List[Dict]) -> None:
@@ -65,37 +68,38 @@ class Renderer:
         Render a Gantt-style chart:
 
         Tick  0 │ SensorRead    ████ RUNNING   │ pri=3  rem=4
-        Tick  1 │ SensorRead    ████ RUNNING   │ pri=3  rem=3
         Tick  2 │ CPU IDLE      ░░░░           │
         """
         print(BOLD("  EXECUTION TIMELINE"))
-        print("  " + "─" * 60)
+        print("  " + "─" * 64)
 
-        for event in timeline:
-            tick    = event["tick"]
-            running = event.get("running_task")
-            is_dead = event.get("deadlock", False)
+        for entry in timeline:
+            tick = entry["tick"]
 
-            if is_dead:
-                print(f"  Tick {tick:>3} │ {RED('⚠️  DEADLOCK — simulation halted')}")
+            if entry.get("deadlock"):
+                print(f"  Tick {tick:>3} │ {RED('DEADLOCK — simulation halted')}")
                 break
 
-            if running is None:
-                bar = DIM("░░░░░░░")
-                print(f"  Tick {tick:>3} │ {DIM('CPU IDLE'):<28} {bar}")
-            else:
-                colour  = self._colour_map.get(running.name, lambda x: x)
-                bar     = colour("███████")
-                state   = running.state.name
-                name    = colour(f"{running.name:<16}")
-                details = DIM(f"pri={running.priority}  rem={running.remaining_burst}")
-                print(f"  Tick {tick:>3} │ {name} {bar} {state:<10} │ {details}")
+            name = entry.get("running")
+            if name is None:
+                print(f"  Tick {tick:>3} │ {DIM('CPU IDLE'):<28} {DIM('░░░░░░░')}")
+                continue
 
-        print("  " + "─" * 60)
+            colour = self._colour_map.get(name, lambda x: x)
+            base, eff = entry["priority"], entry["effective_priority"]
+            pri = f"pri={base}" if eff == base else f"pri={base}->{eff}"
+            marker = "*" if eff != base else " "
+            details = DIM(f"{pri}  rem={entry['remaining']}")
+            label = colour(f"{name:<16}")
+            print(f"  Tick {tick:>3} │ {label} {colour('███████')}{marker}"
+                  f" {'RUNNING':<9} │ {details}")
+
+        print("  " + "─" * 64)
+        print(DIM("  * = running at an inherited (boosted) priority"))
         print()
 
     def _render_events(self, timeline: List[Dict]) -> None:
-        """Print a log of all notable events (arrivals, preemptions, mutex ops, completions)."""
+        """Print a log of all notable events."""
         notable = [
             (e["tick"], ev)
             for e in timeline
@@ -106,16 +110,20 @@ class Renderer:
             return
 
         print(BOLD("  EVENT LOG"))
-        print("  " + "─" * 60)
+        print("  " + "─" * 64)
         for tick, ev in notable:
             prefix = f"  t={tick:<3} │ "
-            if "PREEMPT" in ev:
+            if "DEADLOCK" in ev:
+                print(prefix + RED(BOLD(ev)))
+            elif "INHERITANCE" in ev:
+                print(prefix + MAGENTA(ev))
+            elif "PRIORITY RESTORED" in ev:
+                print(prefix + DIM(ev))
+            elif "PREEMPT" in ev:
                 print(prefix + YELLOW(ev))
-            elif "DEADLOCK" in ev:
+            elif "BLOCKED" in ev or "WARNING" in ev or "ERROR" in ev:
                 print(prefix + RED(ev))
-            elif "BLOCKED" in ev:
-                print(prefix + RED(ev))
-            elif "UNBLOCKED" in ev or "ACQUIRED" in ev:
+            elif "UNBLOCKED" in ev or "ACQUIRED" in ev or "RELEASED" in ev:
                 print(prefix + GREEN(ev))
             elif "DONE" in ev:
                 print(prefix + CYAN(ev))
@@ -128,40 +136,45 @@ class Renderer:
     def _render_statistics(self, stats: Dict) -> None:
         """Render the final summary statistics table."""
         print(BOLD("  FINAL STATISTICS"))
-        print("  " + "═" * 60)
+        print("  " + "═" * 64)
 
-        total = stats["total_ticks"]
-        print(f"  Total ticks simulated  : {BOLD(str(total))}")
+        print(f"  Total ticks simulated  : {BOLD(str(stats['total_ticks']))}")
+        print(f"  Ticks executing work   : {stats['executing_ticks']}")
         print(f"  CPU utilisation        : {BOLD(str(stats['cpu_utilisation']) + '%')}")
         print(f"  Idle ticks             : {stats['idle_ticks']}")
         print(f"  Preemption events      : {YELLOW(str(stats['preemption_count']))}")
+        print(f"  Priority inheritances  : {MAGENTA(str(stats['inheritance_events']))}")
         if stats["deadlock_tick"] is not None:
-            dtick = stats["deadlock_tick"]
-            print(f"  Deadlock detected at   : {RED(f'tick {dtick}')}")
+            print(f"  Deadlock detected at   : {RED('tick ' + str(stats['deadlock_tick']))}")
+            cycle = stats["deadlock_cycle"] or []
+            print(f"  Circular wait          : {RED(' -> '.join(cycle + cycle[:1]))}")
         print()
 
         # Per-task table
-        print(f"  {'Task':<18} {'State':<10} {'CPU Ticks':<12} {'Wait':<8} {'Finish':<8} {'Turnaround'}")
-        print("  " + "─" * 60)
+        header = (f"  {'Task':<16} {'State':<9} {'CPU':<5} {'Wait':<6} "
+                  f"{'Blocked':<9} {'Finish':<8} {'Turnaround'}")
+        print(header)
+        print("  " + "─" * 64)
         for t in stats["tasks"]:
             colour = self._colour_map.get(t["name"], lambda x: x)
-            name    = colour(f"{t['name']:<18}")
-            state   = t["state"]
-            cpu     = str(t["cpu_ticks_used"])
-            wait    = str(t["wait_time"])
-            finish  = str(t["finish_tick"]) if t["finish_tick"] else "—"
-            ta      = str(t["turnaround_time"]) if t["turnaround_time"] else "—"
-            print(f"  {name} {state:<10} {cpu:<12} {wait:<8} {finish:<8} {ta}")
+            # `is not None`, not truthiness: a task can legitimately finish at
+            # tick 0, and "0" must not render as an em-dash.
+            finish = str(t["finish_tick"]) if t["finish_tick"] is not None else "—"
+            ta = str(t["turnaround_time"]) if t["turnaround_time"] is not None else "—"
+            name = colour("{:<16}".format(t["name"]))
+            print(f"  {name} {t['state']:<9} {t['cpu_ticks_used']:<5} "
+                  f"{t['wait_time']:<6} {t['blocked_time']:<9} {finish:<8} {ta}")
 
         # Mutex contention table
         if stats["mutex_stats"]:
             print()
-            print(f"  {'Mutex':<20} {'Acquisitions':<15} {'Contention Events'}")
-            print("  " + "─" * 50)
+            print(f"  {'Mutex':<18} {'Acquisitions':<14} {'Contention':<12} {'Held by'}")
+            print("  " + "─" * 64)
             for m in stats["mutex_stats"]:
-                print(
-                    f"  {m['name']:<20} {m['acquisition_count']:<15} "
-                    f"{YELLOW(str(m['contention_count'])) if m['contention_count'] else '0'}"
-                )
+                contention = (YELLOW(str(m["contention_count"]))
+                              if m["contention_count"] else "0")
+                owner = m["owner"] or "free"
+                print(f"  {m['name']:<18} {m['acquisition_count']:<14} "
+                      f"{contention:<12} {owner}")
 
-        print("  " + "═" * 60)
+        print("  " + "═" * 64)
