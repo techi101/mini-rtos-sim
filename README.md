@@ -182,6 +182,12 @@ not simply snap back to its base priority — it recomputes from the mutexes it
 *still* holds, so a task holding a second contended lock keeps the boost it
 still needs.
 
+**A stall is not a deadlock.**
+If a task finishes while still holding a mutex, its waiters can never wake —
+but there is no cycle, so calling it a deadlock would be wrong. The scheduler
+reports that case separately as `STALLED` and halts, rather than burying it
+under a wall of `CPU IDLE` lines until `--ticks` runs out.
+
 **Ties do not cause a context switch.**
 When several tasks share the highest effective priority, the incumbent keeps
 the CPU. That matches Mbed OS and FreeRTOS with time-slicing disabled;
@@ -219,8 +225,9 @@ the fixes are most of what the code now demonstrates.
 | CPU utilisation counted a deadlocked tick as 100% busy | Utilisation counts only ticks that advanced a task |
 | `finish_tick`/`turnaround` rendered `0` as an em-dash (falsy check) | `is not None` |
 | Re-acquiring a non-recursive mutex silently queued the owner behind itself | Raises `RuntimeError` |
-| A task finishing while holding a contended mutex stranded its waiters silently | End-of-burst releases fire; an unreleased contended mutex is reported |
-| Zero tests for the scheduler — all 16 tests covered `Task` and `Mutex` only | 79 tests, including regression tests for every row above |
+| A task finishing while holding a contended mutex stranded its waiters silently | End-of-burst releases fire; an unreleased contended mutex is reported, and the run halts as `STALLED` instead of idling out the clock |
+| A `burst=0` task was dispatched for one tick before the completion check noticed, reporting `cpu_ticks_used=1` against `burst=0` | `Task` rejects `burst < 1`, negative arrivals, and an `acquire` scheduled at the very end of a burst |
+| Zero tests for the scheduler — all 16 tests covered `Task` and `Mutex` only | 86 tests, including regression tests for every row above |
 
 ---
 
@@ -231,11 +238,11 @@ pytest tests/ -v
 ```
 
 ```
-tests/test_mutex.py ......................          [ 27%]
-tests/test_scheduler.py ...............................  [ 78%]
-tests/test_task.py .................                 [100%]
+tests/test_mutex.py .............................
+tests/test_scheduler.py .....................................
+tests/test_task.py ....................
 
-79 passed in 0.61s
+86 passed in 0.34s
 ```
 
 ---

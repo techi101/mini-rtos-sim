@@ -427,3 +427,77 @@ class TestStatistics:
         task = by_name(sched, "A")
         assert task.response_time == 0        # ran as soon as it arrived
         assert task.turnaround_time == 3
+
+
+# ── Stall (distinct from deadlock) ───────────────────────────────────────────
+
+class TestStallDetection:
+    def test_stranded_waiter_halts_instead_of_idling(self):
+        """
+        A task that finishes while holding a mutex strands its waiters. There
+        is no cycle, so it is not a deadlock -- but nothing can ever run
+        again either, and idling out the remaining ticks would bury the
+        problem under a wall of CPU IDLE lines.
+        """
+        tasks = [
+            Task("Holder", priority=1, burst=4, arrival_tick=0,
+                 lock_ops=[LockOp(1, "acquire", "bus")]),      # never released
+            Task("Waiter", priority=2, burst=3, arrival_tick=3,
+                 lock_ops=[LockOp(1, "acquire", "bus")]),
+        ]
+        sched, timeline = run(tasks, {"bus": Mutex("bus")}, max_ticks=60)
+
+        assert sched.stalled_tick is not None
+        assert sched.deadlock_tick is None          # no cycle: owner is DONE
+        assert timeline[-1]["stalled"] is True
+        assert len(timeline) < 20                   # halted, did not idle out
+        assert ticks_where(timeline, "STALLED")
+        assert by_name(sched, "Waiter").is_blocked
+
+    def test_waiting_for_a_late_arrival_is_not_a_stall(self):
+        tasks = [Task("Late", priority=1, burst=2, arrival_tick=5)]
+        sched, timeline = run(tasks, max_ticks=20)
+        assert sched.stalled_tick is None
+        assert sched.idle_ticks == 5
+        assert by_name(sched, "Late").is_done
+
+    def test_clean_run_never_stalls(self):
+        tasks = [
+            Task("Holder", priority=1, burst=5, arrival_tick=0,
+                 lock_ops=[LockOp(1, "acquire", "bus"),
+                           LockOp(4, "release", "bus")]),
+            Task("Waiter", priority=2, burst=3, arrival_tick=3,
+                 lock_ops=[LockOp(1, "acquire", "bus"),
+                           LockOp(2, "release", "bus")]),
+        ]
+        sched, _ = run(tasks, {"bus": Mutex("bus")})
+        assert sched.stalled_tick is None
+        assert all(t.is_done for t in sched.tasks)
+
+
+# ── Task construction guards ─────────────────────────────────────────────────
+
+class TestTaskValidation:
+    def test_zero_burst_is_rejected(self):
+        """
+        A zero-burst task used to be dispatched for one tick before the
+        completion check noticed, reporting cpu_ticks_used=1 against burst=0.
+        """
+        with pytest.raises(ValueError, match="at least one tick"):
+            Task("Ghost", priority=1, burst=0)
+
+    def test_negative_arrival_is_rejected(self):
+        with pytest.raises(ValueError, match="arrival_tick"):
+            Task("Early", priority=1, burst=2, arrival_tick=-1)
+
+    def test_acquire_at_end_of_burst_is_rejected(self):
+        """Taking a lock with no work left to do with it is a scenario bug."""
+        with pytest.raises(ValueError, match="very end of its burst"):
+            Task("A", priority=1, burst=3,
+                 lock_ops=[LockOp(3, "acquire", "bus")])
+
+    def test_release_at_end_of_burst_is_allowed(self):
+        task = Task("A", priority=1, burst=3,
+                    lock_ops=[LockOp(0, "acquire", "bus"),
+                              LockOp(3, "release", "bus")])
+        assert len(task.lock_ops) == 2

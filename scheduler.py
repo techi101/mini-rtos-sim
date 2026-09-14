@@ -86,6 +86,7 @@ class Scheduler:
         self.inheritance_events = 0
         self.deadlock_tick: Optional[int] = None
         self.deadlock_cycle: Optional[List[str]] = None
+        self.stalled_tick: Optional[int] = None
 
     def _validate_lock_ops(self) -> None:
         """Fail loudly on a scenario that names a mutex that does not exist."""
@@ -168,6 +169,23 @@ class Scheduler:
 
             # ── Step 3: Nothing runnable — the CPU idles ─────────────────
             if runner is None:
+                # Distinguish "waiting for a task to arrive" from "nothing can
+                # ever run again". The latter happens when a task finishes
+                # while still holding a mutex: its waiters are blocked forever,
+                # but there is no cycle, so it is not a deadlock. Idling out
+                # the remaining ticks would bury the problem in CPU IDLE lines.
+                if self._is_stalled(tick):
+                    stranded = ", ".join(
+                        f"{t.name} on '{t.blocked_on_mutex}'"
+                        for t in self.tasks if t.is_blocked)
+                    events.append(
+                        f"STALLED — no task can ever run again; blocked: {stranded}"
+                    )
+                    self.stalled_tick = tick
+                    self.timeline.append(self._record(tick, None, events,
+                                                      stalled=True))
+                    break
+
                 self.idle_ticks += 1
                 events.append("CPU IDLE")
                 self._accumulate_waiting(tick, runner=None)
@@ -392,6 +410,33 @@ class Scheduler:
             edges[task.name] = mutex.owner.name
         return edges
 
+    def _is_stalled(self, current_tick: int) -> bool:
+        """
+        True when no task is runnable and none ever will be again.
+
+        Distinct from deadlock: there is no cycle here. It happens when a task
+        finishes holding a mutex, stranding its waiters on a lock whose owner
+        is already DONE and will never release it. Nothing else can arrive and
+        nothing can wake them, so the run may as well stop and say so.
+        """
+        pending = [t for t in self.tasks if not t.is_done]
+        if not pending:
+            return False
+        if any(t.arrival_tick > current_tick for t in pending):
+            return False                       # someone is still to arrive
+        if any(t.is_ready or t.is_running for t in pending):
+            return False                       # someone can still run
+
+        # Every pending task is blocked. If any waits on a mutex whose owner
+        # is still pending, that owner may yet release it (that case is either
+        # progress or a cycle, both handled elsewhere).
+        for task in pending:
+            mutex = self.mutexes.get(task.blocked_on_mutex or "")
+            if mutex is not None and mutex.owner is not None \
+                    and not mutex.owner.is_done:
+                return False
+        return True
+
     def _find_deadlock_cycle(self) -> Optional[List[str]]:
         """
         Return the task names forming a circular wait, or None.
@@ -430,14 +475,15 @@ class Scheduler:
         return str(task.priority)
 
     def _record(self, tick: int, runner: Optional[Task], events: List[str],
-                deadlock: bool = False) -> ScheduleEvent:
+                deadlock: bool = False, stalled: bool = False) -> ScheduleEvent:
         """Snapshot one tick as plain values, taken at the moment it ran."""
         if runner is None:
+            state = "DEADLOCK" if deadlock else "STALLED" if stalled else "IDLE"
             return {
                 "tick": tick, "running": None, "priority": None,
                 "effective_priority": None, "remaining": None,
-                "state": "DEADLOCK" if deadlock else "IDLE",
-                "events": events, "deadlock": deadlock, "finished": False,
+                "state": state, "events": events,
+                "deadlock": deadlock, "stalled": stalled, "finished": False,
             }
         return {
             "tick": tick,
@@ -448,6 +494,7 @@ class Scheduler:
             "state": "RUNNING",
             "events": events,
             "deadlock": False,
+            "stalled": False,
             "finished": False,
         }
 
@@ -472,6 +519,7 @@ class Scheduler:
             "inheritance_events" : self.inheritance_events,
             "deadlock_tick"      : self.deadlock_tick,
             "deadlock_cycle"     : self.deadlock_cycle,
+            "stalled_tick"       : self.stalled_tick,
             "priority_inheritance_enabled": self.enable_priority_inheritance,
             "tasks"              : [
                 {

@@ -118,10 +118,28 @@ class Task:
     def __post_init__(self):
         """Initialise remaining_burst from burst after dataclass __init__."""
         self.remaining_burst = self.burst
+        if self.burst < 1:
+            # A zero-burst task would still be dispatched for one tick before
+            # the completion check noticed, reporting cpu_ticks_used=1 against
+            # burst=0. A task with no work to do is a scenario bug.
+            raise ValueError(
+                f"Task {self.name!r} has burst={self.burst}; a task must need "
+                f"at least one tick of CPU."
+            )
+        if self.arrival_tick < 0:
+            raise ValueError(
+                f"Task {self.name!r} has arrival_tick={self.arrival_tick}"
+            )
         if any(op.after_ticks > self.burst for op in self.lock_ops):
             raise ValueError(
                 f"Task {self.name!r} has a lock op scheduled after more ticks "
                 f"than its burst ({self.burst}); it would never fire."
+            )
+        if any(op.after_ticks == self.burst and op.action == "acquire"
+               for op in self.lock_ops):
+            raise ValueError(
+                f"Task {self.name!r} acquires a mutex at the very end of its "
+                f"burst, when it has no work left to do with it."
             )
 
     # ── Priority ──────────────────────────────────────────────────────────

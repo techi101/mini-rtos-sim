@@ -80,6 +80,10 @@ class Renderer:
                 print(f"  Tick {tick:>3} │ {RED('DEADLOCK — simulation halted')}")
                 break
 
+            if entry.get("stalled"):
+                print(f"  Tick {tick:>3} │ {RED('STALLED — no task can ever run again')}")
+                break
+
             name = entry.get("running")
             if name is None:
                 print(f"  Tick {tick:>3} │ {DIM('CPU IDLE'):<28} {DIM('░░░░░░░')}")
@@ -121,6 +125,8 @@ class Renderer:
                 print(prefix + DIM(ev))
             elif "PREEMPT" in ev:
                 print(prefix + YELLOW(ev))
+            elif "STALLED" in ev:
+                print(prefix + RED(BOLD(ev)))
             elif "BLOCKED" in ev or "WARNING" in ev or "ERROR" in ev:
                 print(prefix + RED(ev))
             elif "UNBLOCKED" in ev or "ACQUIRED" in ev or "RELEASED" in ev:
@@ -144,6 +150,8 @@ class Renderer:
         print(f"  Idle ticks             : {stats['idle_ticks']}")
         print(f"  Preemption events      : {YELLOW(str(stats['preemption_count']))}")
         print(f"  Priority inheritances  : {MAGENTA(str(stats['inheritance_events']))}")
+        if stats.get("stalled_tick") is not None:
+            print(f"  Stalled at             : {RED('tick ' + str(stats['stalled_tick']))}")
         if stats["deadlock_tick"] is not None:
             print(f"  Deadlock detected at   : {RED('tick ' + str(stats['deadlock_tick']))}")
             cycle = stats["deadlock_cycle"] or []
